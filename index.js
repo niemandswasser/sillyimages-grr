@@ -48,7 +48,7 @@ function exportLogs() {
 // Default settings
 const defaultSettings = Object.freeze({
     enabled: true,
-    apiType: 'openai', // 'openai' | 'gemini' | 'naistera'
+    apiType: 'openai', // 'openai' | 'gemini' | 'naistera' | 'grok'
     endpoint: '',
     apiKey: '',
     model: '',
@@ -73,7 +73,7 @@ const defaultSettings = Object.freeze({
 const IMAGE_MODEL_KEYWORDS = [
     'dall-e', 'midjourney', 'mj', 'journey', 'stable-diffusion', 'sdxl', 'flux',
     'imagen', 'drawing', 'paint', 'image', 'seedream', 'hidream', 'dreamshaper',
-    'ideogram', 'nano-banana', 'gpt-image', 'wanx', 'qwen'
+    'ideogram', 'nano-banana', 'gpt-image', 'wanx', 'qwen', 'imagine', 'grok-imagine'
 ];
 
 // Video model keywords to exclude
@@ -628,6 +628,179 @@ async function generateImageNaistera(prompt, style, options = {}) {
 }
 
 /**
+ * Generate image via Grok2API using /v1/chat/completions
+ * Supports sending reference images alongside the prompt
+ */
+async function generateImageGrok(prompt, style, referenceImages = [], options = {}) {
+    const settings = getSettings();
+    const baseUrl = settings.endpoint.replace(/\/$/, '');
+    const url = `${baseUrl}/v1/chat/completions`;
+
+    const fullPrompt = style ? `[Style: ${style}] ${prompt}` : prompt;
+
+    // Build content array with text and reference images
+    const content = [];
+
+    // Add reference images first
+    if (referenceImages.length > 0) {
+        content.push({
+            type: 'text',
+            text: '[CHARACTER REFERENCES]\nThe following images show the EXACT appearance of characters. When generating the scene, these characters MUST look IDENTICAL to their references.\n'
+        });
+
+        for (const ref of referenceImages.slice(0, 4)) {
+            // ref can be base64 string or {data, label, mimeType} object
+            let imgData, mimeType, label;
+            if (typeof ref === 'string') {
+                imgData = ref;
+                mimeType = ref.startsWith('/9j/') ? 'image/jpeg' : 'image/png';
+                label = 'character';
+            } else if (ref.data) {
+                imgData = ref.data;
+                mimeType = ref.mimeType || (ref.data.startsWith('/9j/') ? 'image/jpeg' : 'image/png');
+                label = ref.label || 'character';
+            } else {
+                continue;
+            }
+
+            content.push({
+                type: 'image_url',
+                image_url: {
+                    url: `data:${mimeType};base64,${imgData}`
+                }
+            });
+            content.push({
+                type: 'text',
+                text: `^^^ This is "${label}" — COPY this appearance EXACTLY.\n`
+            });
+        }
+    }
+
+    // Add the main prompt
+    content.push({
+        type: 'text',
+        text: `[SCENE TO GENERATE]\n${fullPrompt}\n\nGenerate this image now.`
+    });
+
+    // Determine image config size
+    let imgSize = settings.size || '1024x1024';
+    const GROK_VALID_SIZES = ['1024x1024', '1024x1792', '1280x720', '1792x1024', '720x1280'];
+    if (!GROK_VALID_SIZES.includes(imgSize)) {
+        imgSize = '1024x1024';
+    }
+
+    const body = {
+        model: settings.model || 'grok-imagine-1.0',
+        messages: [{
+            role: 'user',
+            content: content
+        }],
+        stream: false,
+        image_config: {
+            n: 1,
+            size: imgSize,
+            response_format: 'b64_json'
+        }
+    };
+
+    iigLog('INFO', `Grok request: ${referenceImages.length} ref(s), model=${body.model}, size=${imgSize}, content parts=${content.length}`);
+
+    const headers = { 'Content-Type': 'application/json' };
+    if (settings.apiKey) {
+        headers['Authorization'] = `Bearer ${settings.apiKey}`;
+    }
+
+    const response = await fetch(url, {
+        method: 'POST',
+        headers: headers,
+        body: JSON.stringify(body)
+    });
+
+    if (!response.ok) {
+        const text = await response.text();
+        throw new Error(`API Error (${response.status}): ${text}`);
+    }
+
+    const result = await response.json();
+    iigLog('INFO', 'Grok response structure:', Object.keys(result));
+
+    // Response is chat completion format
+    if (result.choices && result.choices.length > 0) {
+        const messageContent = result.choices[0].message?.content || '';
+
+        // Raw base64 image data (JPEG starts with /9j/, PNG with iVBOR)
+        if (messageContent.startsWith('/9j/') || messageContent.startsWith('iVBOR') || messageContent.startsWith('UklGR') || messageContent.startsWith('R0lGOD')) {
+            let mimeType = 'image/png';
+            if (messageContent.startsWith('/9j/')) mimeType = 'image/jpeg';
+            else if (messageContent.startsWith('UklGR')) mimeType = 'image/webp';
+            else if (messageContent.startsWith('R0lGOD')) mimeType = 'image/gif';
+            iigLog('INFO', `Grok returned raw base64 (${mimeType}), length: ${messageContent.length}`);
+            return `data:${mimeType};base64,${messageContent}`;
+        }
+
+        // Relative file path from grok2api
+        if (messageContent.startsWith('/v1/files/')) {
+            const fullImageUrl = `${baseUrl}${messageContent}`;
+            iigLog('INFO', 'Grok returned file path, downloading:', fullImageUrl);
+            const imgResponse = await fetch(fullImageUrl);
+            const blob = await imgResponse.blob();
+            return await new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onloadend = () => resolve(reader.result);
+                reader.onerror = reject;
+                reader.readAsDataURL(blob);
+            });
+        }
+
+        // Full URL
+        if (messageContent.startsWith('http://') || messageContent.startsWith('https://')) {
+            const imgResponse = await fetch(messageContent);
+            const blob = await imgResponse.blob();
+            return await new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onloadend = () => resolve(reader.result);
+                reader.onerror = reject;
+                reader.readAsDataURL(blob);
+            });
+        }
+
+        // Already a data URL
+        if (messageContent.startsWith('data:')) {
+            return messageContent;
+        }
+
+        iigLog('WARN', 'Grok response content (not recognized as image):', messageContent.substring(0, 200));
+    }
+
+    // Fallback: standard OpenAI image response format
+    const dataList = result.data || [];
+    if (dataList.length > 0) {
+        const imageObj = dataList[0];
+        const b64Data = imageObj.b64_json || imageObj.b64 || imageObj.base64;
+        if (b64Data) {
+            const mimeType = b64Data.startsWith('/9j/') ? 'image/jpeg' : 'image/png';
+            return `data:${mimeType};base64,${b64Data}`;
+        }
+        if (imageObj.url) {
+            if (imageObj.url.startsWith('/v1/')) {
+                const fullUrl = `${baseUrl}${imageObj.url}`;
+                const imgResp = await fetch(fullUrl);
+                const blob = await imgResp.blob();
+                return await new Promise((res, rej) => {
+                    const r = new FileReader();
+                    r.onloadend = () => res(r.result);
+                    r.onerror = rej;
+                    r.readAsDataURL(blob);
+                });
+            }
+            return imageObj.url;
+        }
+    }
+
+    throw new Error('No image found in Grok response');
+}
+
+/**
  * Validate settings before generation
  */
 function validateSettings() {
@@ -640,7 +813,7 @@ function validateSettings() {
     if (!settings.apiKey) {
         errors.push('API ключ не настроен');
     }
-    if (settings.apiType !== 'naistera' && !settings.model) {
+    if (settings.apiType !== 'naistera' && settings.apiType !== 'grok' && !settings.model) {
         errors.push('Модель не выбрана');
     }
     
@@ -700,6 +873,37 @@ async function generateImageWithRetry(prompt, style, onStatusUpdate, options = {
             if (d) referenceDataUrls.push(d);
         }
     }
+
+    // Grok references: base64 with labels (sent via chat completions)
+    if (settings.apiType === 'grok') {
+        if (settings.naisteraSendCharAvatar || settings.sendCharAvatar) {
+            iigLog('INFO', 'Fetching character avatar for Grok reference...');
+            const charAvatar = await getCharacterAvatarBase64();
+            if (charAvatar) {
+                const charName = SillyTavern.getContext().characters?.[SillyTavern.getContext().characterId]?.name || 'Character';
+                referenceImages.push({
+                    data: charAvatar,
+                    label: charName,
+                    mimeType: charAvatar.startsWith('/9j/') ? 'image/jpeg' : 'image/png'
+                });
+                iigLog('INFO', `Grok: character avatar added: "${charName}", ${Math.round(charAvatar.length/1024)}KB`);
+            }
+        }
+        if (settings.naisteraSendUserAvatar || settings.sendUserAvatar) {
+            iigLog('INFO', 'Fetching user avatar for Grok reference...');
+            const userAvatar = await getUserAvatarBase64();
+            if (userAvatar) {
+                const userName = settings.userAvatarFile?.replace(/\.[^.]+$/, '') || 'User';
+                referenceImages.push({
+                    data: userAvatar,
+                    label: userName,
+                    mimeType: userAvatar.startsWith('/9j/') ? 'image/jpeg' : 'image/png'
+                });
+                iigLog('INFO', `Grok: user avatar added: "${userName}", ${Math.round(userAvatar.length/1024)}KB`);
+            }
+        }
+        iigLog('INFO', `Grok: total references: ${referenceImages.length}`);
+    }
     
     let lastError;
     
@@ -710,6 +914,8 @@ async function generateImageWithRetry(prompt, style, onStatusUpdate, options = {
             // Choose API based on type or model
             if (settings.apiType === 'naistera') {
                 return await generateImageNaistera(prompt, style, { ...options, referenceImages: referenceDataUrls });
+            } else if (settings.apiType === 'grok') {
+                return await generateImageGrok(prompt, style, referenceImages, options);
             } else if (settings.apiType === 'gemini' || isGeminiModel(settings.model)) {
                 return await generateImageGemini(prompt, style, referenceImages, options);
             } else {
@@ -1554,6 +1760,7 @@ function createSettingsUI() {
                         <label for="iig_api_type">Тип API</label>
                         <select id="iig_api_type" class="flex1">
                             <option value="openai" ${settings.apiType === 'openai' ? 'selected' : ''}>OpenAI-совместимый (/v1/images/generations)</option>
+                            <option value="grok" ${settings.apiType === 'grok' ? 'selected' : ''}>Grok (grok2api — рефы через chat)</option>
                             <option value="gemini" ${settings.apiType === 'gemini' ? 'selected' : ''}>Gemini-совместимый (nano-banana)</option>
                             <option value="naistera" ${settings.apiType === 'naistera' ? 'selected' : ''}>Naistera/Grok (naistera.org)</option>
                         </select>
@@ -1768,20 +1975,24 @@ function bindSettingsEvents() {
         const isNaistera = apiType === 'naistera';
         const isGemini = apiType === 'gemini';
         const isOpenAI = apiType === 'openai';
+        const isGrok = apiType === 'grok';
 
-        // Model is used for OpenAI and Gemini; Naistera does not need a model.
+        // Model row: shown for OpenAI, Gemini, and Grok; hidden for Naistera
         document.getElementById('iig_model_row')?.classList.toggle('iig-hidden', isNaistera);
 
-        // OpenAI-only params
-        document.getElementById('iig_size_row')?.classList.toggle('iig-hidden', !isOpenAI);
+        // OpenAI-only params (size also shown for Grok)
+        document.getElementById('iig_size_row')?.classList.toggle('iig-hidden', !(isOpenAI || isGrok));
         document.getElementById('iig_quality_row')?.classList.toggle('iig-hidden', !isOpenAI);
 
         // Naistera-only params
         document.getElementById('iig_naistera_aspect_row')?.classList.toggle('iig-hidden', !isNaistera);
         document.getElementById('iig_naistera_preset_row')?.classList.toggle('iig-hidden', !isNaistera);
-        document.getElementById('iig_naistera_refs_section')?.classList.toggle('iig-hidden', !isNaistera);
-        document.getElementById('iig_naistera_user_avatar_row')?.classList.toggle('iig-hidden', !(isNaistera && settings.naisteraSendUserAvatar));
 
+        // Naistera refs section: shown for both Naistera and Grok
+        document.getElementById('iig_naistera_refs_section')?.classList.toggle('iig-hidden', !(isNaistera || isGrok));
+        document.getElementById('iig_naistera_user_avatar_row')?.classList.toggle('iig-hidden', !((isNaistera || isGrok) && settings.naisteraSendUserAvatar));
+
+        // Hints
         document.getElementById('iig_naistera_hint')?.classList.toggle('iig-hidden', !isNaistera);
 
         // Avatar section is only for Gemini/nano-banana
